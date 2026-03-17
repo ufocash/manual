@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import smtplib
+import sys
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -48,6 +49,38 @@ def _attach_files(message: EmailMessage, attachments: list[str]) -> None:
             subtype=subtype,
             filename=path.name,
         )
+
+
+def _print_error(
+    *,
+    code: str,
+    message: str,
+    details: str | None = None,
+    hints: list[str] | None = None,
+) -> None:
+    payload: dict[str, object] = {"status": "error", "code": code, "message": message}
+    if details:
+        payload["details"] = details
+    if hints:
+        payload["hints"] = hints
+    print(json.dumps(payload, ensure_ascii=True), file=sys.stderr)
+
+
+def _gmail_auth_hints() -> list[str]:
+    return [
+        "Use a Gmail App Password (requires 2-Step Verification); regular account passwords are rejected.",
+        "Set GOG_SMTP_USERNAME to the full sender email address (example: you@gmail.com).",
+        "If the app password was rotated, update GOG_SMTP_PASSWORD and try again.",
+        "Reference: https://support.google.com/mail/?p=BadCredentials",
+    ]
+
+
+def _decode_smtp_error(raw: bytes | str | None) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
 
 
 def build_message(args: argparse.Namespace, from_email: str) -> tuple[EmailMessage, list[str]]:
@@ -112,6 +145,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--html-body", default="", help="Optional HTML body")
     parser.add_argument("--attachment", action="append", help="Attachment file path")
     parser.add_argument("--dry-run", action="store_true", help="Validate and build message only")
+    parser.add_argument("--debug", action="store_true", help="Show Python traceback on unexpected errors")
     return parser.parse_args()
 
 
@@ -125,55 +159,98 @@ def main() -> int:
     use_ssl = _env_bool("GOG_SMTP_USE_SSL", default=False)
     from_email = os.getenv("GOG_FROM_EMAIL", smtp_user).strip()
 
-    if not smtp_user:
-        raise ValueError("Missing required env var: GOG_SMTP_USERNAME")
-    if not smtp_pass:
-        raise ValueError("Missing required env var: GOG_SMTP_PASSWORD")
-    if not from_email:
-        raise ValueError("Unable to determine sender address (set GOG_FROM_EMAIL)")
+    try:
+        if not smtp_user:
+            raise ValueError("Missing required env var: GOG_SMTP_USERNAME")
+        if not smtp_pass:
+            raise ValueError("Missing required env var: GOG_SMTP_PASSWORD")
+        if not from_email:
+            raise ValueError("Unable to determine sender address (set GOG_FROM_EMAIL)")
+        if smtp_user == "your-account@gmail.com" or smtp_pass == "your-app-password":
+            raise ValueError("Placeholder credentials detected; replace values from .env.example")
 
-    message, recipients = build_message(args, from_email=from_email)
+        message, recipients = build_message(args, from_email=from_email)
 
-    if args.dry_run:
+        if args.dry_run:
+            print(
+                json.dumps(
+                    {
+                        "status": "dry_run_ok",
+                        "smtp_host": smtp_host,
+                        "smtp_port": smtp_port,
+                        "use_ssl": use_ssl,
+                        "from": from_email,
+                        "recipient_count": len(recipients),
+                        "subject": args.subject,
+                        "attachments": len(args.attachment or []),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return 0
+
+        send_via_smtp(
+            message=message,
+            recipients=recipients,
+            host=smtp_host,
+            port=smtp_port,
+            username=smtp_user,
+            password=smtp_pass,
+            use_ssl=use_ssl,
+        )
+
         print(
             json.dumps(
                 {
-                    "status": "dry_run_ok",
-                    "smtp_host": smtp_host,
-                    "smtp_port": smtp_port,
-                    "use_ssl": use_ssl,
+                    "status": "sent",
                     "from": from_email,
                     "recipient_count": len(recipients),
                     "subject": args.subject,
-                    "attachments": len(args.attachment or []),
                 },
                 ensure_ascii=True,
             )
         )
         return 0
-
-    send_via_smtp(
-        message=message,
-        recipients=recipients,
-        host=smtp_host,
-        port=smtp_port,
-        username=smtp_user,
-        password=smtp_pass,
-        use_ssl=use_ssl,
-    )
-
-    print(
-        json.dumps(
-            {
-                "status": "sent",
-                "from": from_email,
-                "recipient_count": len(recipients),
-                "subject": args.subject,
-            },
-            ensure_ascii=True,
+    except (ValueError, FileNotFoundError) as exc:
+        _print_error(code="invalid_input", message=str(exc))
+        return 2
+    except smtplib.SMTPAuthenticationError as exc:
+        details = _decode_smtp_error(exc.smtp_error)
+        hints = _gmail_auth_hints() if "gmail" in smtp_host.lower() else [
+            "Verify SMTP username/password and any provider-specific app-password requirements.",
+            "Confirm SMTP host/port and TLS mode (GOG_SMTP_USE_SSL).",
+        ]
+        _print_error(
+            code="smtp_auth_failed",
+            message=f"SMTP authentication failed (code={exc.smtp_code}).",
+            details=details,
+            hints=hints,
         )
-    )
-    return 0
+        return 3
+    except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, TimeoutError, OSError) as exc:
+        _print_error(
+            code="smtp_connection_failed",
+            message=f"Could not connect to SMTP server {smtp_host}:{smtp_port}.",
+            details=str(exc),
+            hints=[
+                "Check internet connectivity and firewall rules.",
+                "Confirm host/port are correct for your provider.",
+                "If using port 465, set GOG_SMTP_USE_SSL=true.",
+            ],
+        )
+        return 4
+    except smtplib.SMTPException as exc:
+        _print_error(code="smtp_error", message="SMTP error while sending email.", details=str(exc))
+        return 5
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        if args.debug:
+            raise
+        _print_error(
+            code="unexpected_error",
+            message="Unexpected error. Re-run with --debug for traceback.",
+            details=str(exc),
+        )
+        return 99
 
 
 if __name__ == "__main__":

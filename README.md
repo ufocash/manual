@@ -17,3 +17,6 @@ python3 scripts/send_email.py \
   --subject "Test email" \
   --body "Hello from OpenClaw"
 ```
+
+If Gmail returns `535 5.7.8 Username and Password not accepted`, use a Gmail App Password
+(with 2FA enabled) for `GOG_SMTP_PASSWORD` instead of your regular account password.

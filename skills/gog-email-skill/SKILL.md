@@ -67,3 +67,12 @@ python3 scripts/send_email.py \
 
 - If by "gog" you meant Google/Gmail, defaults already target Gmail SMTP.
 - For Gmail personal accounts, use an app password (2FA required), not the account password.
+
+## Troubleshooting
+
+If you get `smtp_auth_failed` or Gmail `535 5.7.8 Username and Password not accepted`:
+
+1. Enable Google 2-Step Verification.
+2. Generate a Gmail App Password and set it as `GOG_SMTP_PASSWORD`.
+3. Set `GOG_SMTP_USERNAME` to the full email address (for example `you@gmail.com`).
+4. Re-run with `--dry-run` first to validate runtime config, then send.
